@@ -12,9 +12,10 @@ class ScanWorker(QThread):
     done = Signal(list)
     error = Signal(str)
 
-    def __init__(self, root: str):
+    def __init__(self, roots):
         super().__init__()
-        self.root = root
+        # 兼容单盘调用：传 str 也能工作
+        self.roots = [roots] if isinstance(roots, str) else list(roots)
         self._stop = False
 
     def stop(self):
@@ -22,11 +23,22 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            paths = scan_folders(
-                self.root,
-                on_progress=self.progress.emit,
-                should_stop=lambda: self._stop,
-            )
+            # 多盘串行扫描但共用一个结果列表，进度按总量累计，
+            # 这样界面进度条不会在每个盘切换时归零。
+            paths = []
+            for root in self.roots:
+                if self._stop:
+                    break
+
+                def _on_progress(n, _paths=paths):
+                    self.progress.emit(len(_paths))
+
+                found = scan_folders(
+                    root,
+                    on_progress=_on_progress,
+                    should_stop=lambda: self._stop,
+                )
+                paths.extend(found)
             self.done.emit(paths)
         except Exception as e:
             self.error.emit(str(e))
@@ -79,14 +91,19 @@ class MatchWorker(QThread):
 
     def run(self):
         try:
-            k = max(self.topn, self.candidate_k) if self.use_semantic else self.topn
-            rules = top_k(self.prepared, self.query, k)
-
-            if self.use_semantic and semantic.is_available() and rules:
+            if self.use_semantic and semantic.is_available() and semantic.is_ready():
+                # 候选池取比 TopN 更大的范围，交给语义分重排后再截断
+                rules = top_k(self.prepared, self.query, max(self.topn, self.candidate_k))
+                # 规则分为 0 表示连字面都不沾边，留着只会挤占语义重排的算力
+                rules = [(s, p) for s, p in rules if s > 0]
+                if not rules:
+                    self.done.emit(self.gen, [])
+                    return
                 cands = [(s, p.raw) for s, p in rules]
                 reranked = semantic.rerank(self.query, cands, self.topn)
                 self.done.emit(self.gen, reranked)
             else:
-                self.done.emit(self.gen, [(s, p.raw, None) for s, p in rules[: self.topn]])
+                rules = top_k(self.prepared, self.query, self.topn)
+                self.done.emit(self.gen, [(s, p.raw, None) for s, p in rules])
         except Exception:
             self.done.emit(self.gen, [])

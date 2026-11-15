@@ -80,24 +80,41 @@ def parse_query(query: str) -> ParsedQuery:
 def score_prepared(prep: PreparedPath, q: ParsedQuery) -> float:
     """
     规则打分：归一化 + token AND + 去分隔符子串，双路取 max。
-    - 先算 basename；若已很高，跳过完整路径，减少开销。
+
+    多关键词采用「AND 召回 + 平均分排序」：
+    - 只要有一个关键词在 basename 和完整路径里都完全没命中（得分为 0），
+      说明这条路径与该查询无关，直接返回 0.0；
+    - 否则返回各关键词得分的平均值。
+
+    早期版本用 min() 取最小分，会让「folder scout 语义」这类查询在全路径
+    精确匹配 folder 与 scout 的情况下依然得 0 分（因为“语义”不在路径里），
+    配合相关性阈值会把本该展示的结果全部误杀。
     """
     if not q.raw_units:
         return 0.0
 
-    # basename 双路
-    base_norm_score = min(fuzz.partial_ratio(u, prep.base_norm) for u in q.unit_norms)
-    base_strip_score = min(fuzz.partial_ratio(u, prep.base_strip) for u in q.unit_strips)
-    base_best = max(base_norm_score, base_strip_score)
-    if base_best >= 80.0:
-        return base_best
+    def path_scores(attr_norm: str, attr_strip: str) -> List[int]:
+        norm = getattr(prep, attr_norm)
+        strip = getattr(prep, attr_strip)
+        return [
+            max(
+                fuzz.partial_ratio(u_n, norm),
+                fuzz.partial_ratio(u_s, strip),
+            )
+            for u_n, u_s in zip(q.unit_norms, q.unit_strips)
+        ]
 
-    # 完整路径双路
-    full_norm_score = min(fuzz.partial_ratio(u, prep.full_norm) for u in q.unit_norms)
-    full_strip_score = min(fuzz.partial_ratio(u, prep.full_strip) for u in q.unit_strips)
-    full_best = max(full_norm_score, full_strip_score)
+    # basename 优先；若已足够好则不必再算完整路径
+    base_scores = path_scores("base_norm", "base_strip")
+    if min(base_scores) > 0 and sum(base_scores) / len(base_scores) >= 80.0:
+        return sum(base_scores) / len(base_scores)
 
-    return max(base_best, full_best)
+    full_scores = path_scores("full_norm", "full_strip")
+    # 逐关键词取 basename / 完整路径的较大值，再判断是否全部命中
+    best = [max(b, f) for b, f in zip(base_scores, full_scores)]
+    if min(best) <= 0:
+        return 0.0
+    return sum(best) / len(best)
 
 
 def top_k(
